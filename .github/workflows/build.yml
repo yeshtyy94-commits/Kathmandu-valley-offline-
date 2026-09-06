@@ -8,25 +8,39 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Unzip project
         run: unzip -o KathmanduValleyOfflineMaps.zip -d extracted
 
-      - name: Fix Java/Kotlin JVM target mismatch
+      - name: Fix Android build configuration
         run: |
-          cat > extracted/KathmanduValleyOfflineMaps/app/build.gradle << 'EOF'
-          plugins { id 'com.android.application'; id 'org.jetbrains.kotlin.android' }
+          cat > extracted/KathmanduValleyOfflineMaps/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
 
           android {
               namespace 'com.example.kathmanduoffline'
               compileSdk 35
-              defaultConfig { applicationId 'com.example.kathmanduoffline'; minSdk 26; targetSdk 35; versionCode 1; versionName '1.0' }
+
+              defaultConfig {
+                  applicationId 'com.example.kathmanduoffline'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
                   targetCompatibility JavaVersion.VERSION_17
               }
+
               kotlinOptions {
                   jvmTarget = '17'
               }
@@ -41,6 +55,837 @@ jobs:
           }
           EOF
 
+      - name: Fix MainActivity
+        run: |
+          cat > extracted/KathmanduValleyOfflineMaps/app/src/main/java/com/example/kathmanduoffline/MainActivity.kt <<'EOF'
+          package com.example.kathmanduoffline
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.os.Bundle
+          import android.widget.*
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import com.google.android.gms.location.LocationServices
+          import org.maplibre.android.MapLibre
+          import org.maplibre.android.maps.MapView
+          import org.maplibre.android.maps.MapLibreMap
+          import org.maplibre.android.camera.CameraPosition
+          import org.maplibre.android.camera.CameraUpdateFactory
+          import org.maplibre.android.geometry.LatLng
+          import org.maplibre.android.geometry.LatLngBounds
+          import org.maplibre.android.offline.OfflineManager
+          import org.maplibre.android.offline.OfflineRegion
+          import org.maplibre.android.offline.OfflineRegionError
+          import org.maplibre.android.offline.OfflineRegionStatus
+          import org.maplibre.android.offline.OfflineTilePyramidRegionDefinition
+          import org.maplibre.android.annotations.Marker
+          import org.maplibre.android.annotations.MarkerOptions
+          import org.maplibre.android.maps.Style
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var mapView: MapView
+              private lateinit var map: MapLibreMap
+              private lateinit var progressBar: ProgressBar
+              private lateinit var statusText: TextView
+              private lateinit var downloadButton: Button
+              private lateinit var deleteButton: Button
+
+              private var searchMarker: Marker? = null
+              private var youAreHereMarker: Marker? = null
+              private var activeRegion: OfflineRegion? = null
+
+              private val fused by lazy {
+                  LocationServices.getFusedLocationProviderClient(this)
+              }
+
+              private val prefs by lazy {
+                  getSharedPreferences("app", MODE_PRIVATE)
+              }
+
+              private val valleyBounds = LatLngBounds.Builder()
+                  .include(LatLng(27.55, 85.20))
+                  .include(LatLng(27.85, 85.55))
+                  .build()
+
+              private val styleUrl =
+                  "https://tiles.openfreemap.org/styles/liberty"
+
+              private val regionName = "Kathmandu Valley"
+
+              data class Poi(
+                  val name: String,
+                  val city: String,
+                  val lat: Double,
+                  val lng: Double,
+                  val note: String
+              )
+
+              private val knownPlaces = listOf(
+                  Poi(
+                      "Kathmandu Durbar Square",
+                      "Kathmandu",
+                      27.7040,
+                      85.3070,
+                      "Hanuman Dhoka palace complex, UNESCO World Heritage Site"
+                  ),
+                  Poi(
+                      "Patan Durbar Square",
+                      "Lalitpur",
+                      27.6734,
+                      85.3250,
+                      "Malla-era royal square, UNESCO World Heritage Site"
+                  ),
+                  Poi(
+                      "Bhaktapur Durbar Square",
+                      "Bhaktapur",
+                      27.6720,
+                      85.4281,
+                      "Best-preserved of the valley's durbar squares"
+                  ),
+                  Poi(
+                      "Swayambhunath (Monkey Temple)",
+                      "Kathmandu",
+                      27.7150,
+                      85.2900,
+                      "Hilltop Buddhist stupa overlooking the valley"
+                  ),
+                  Poi(
+                      "Boudhanath Stupa",
+                      "Kathmandu",
+                      27.7214,
+                      85.3619,
+                      "One of the largest stupas in the world"
+                  ),
+                  Poi(
+                      "Pashupatinath Temple",
+                      "Kathmandu",
+                      27.7097,
+                      85.3486,
+                      "Sacred Hindu temple on the Bagmati River"
+                  ),
+                  Poi(
+                      "Thamel",
+                      "Kathmandu",
+                      27.7091,
+                      85.3061,
+                      "Main tourist and shopping district"
+                  ),
+                  Poi(
+                      "Tribhuvan International Airport",
+                      "Kathmandu",
+                      27.6912,
+                      85.3553,
+                      "Nepal's international airport (KTM)"
+                  )
+              )
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  MapLibre.getInstance(this)
+
+                  buildUi()
+
+                  mapView.onCreate(savedInstanceState)
+
+                  mapView.getMapAsync { m ->
+                      map = m
+                      loadStyleWithFallback()
+                  }
+
+                  refreshExistingOfflineRegion()
+              }
+
+              private fun buildUi() {
+                  val root = FrameLayout(this)
+
+                  mapView = MapView(this)
+
+                  root.addView(
+                      mapView,
+                      FrameLayout.LayoutParams(
+                          -1,
+                          -1
+                      )
+                  )
+
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(18, 18, 18, 18)
+                      setBackgroundColor(Color.WHITE)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Kathmandu Valley Offline Maps"
+                      textSize = 20f
+                      setTextColor(Color.BLACK)
+                      setPadding(8, 4, 8, 10)
+                  }
+
+                  panel.addView(title)
+
+                  val search = EditText(this).apply {
+                      hint = "Search places..."
+                      setSingleLine(true)
+                  }
+
+                  panel.addView(search)
+
+                  val buttons = LinearLayout(this)
+
+                  fun button(
+                      text: String,
+                      action: () -> Unit
+                  ): Button {
+                      return Button(this).apply {
+                          this.text = text
+                          setOnClickListener {
+                              action()
+                          }
+                      }
+                  }
+
+                  buttons.addView(
+                      button("My Location") {
+                          requestOrLocate()
+                      }
+                  )
+
+                  downloadButton =
+                      button("Download Offline") {
+                          onDownloadClicked()
+                      }
+
+                  buttons.addView(downloadButton)
+
+                  panel.addView(buttons)
+
+                  deleteButton =
+                      button("Delete Offline Data") {
+                          confirmAndDeleteOfflineRegion()
+                      }.apply {
+                          visibility = android.view.View.GONE
+                      }
+
+                  panel.addView(deleteButton)
+
+                  progressBar =
+                      ProgressBar(
+                          this,
+                          null,
+                          android.R.attr.progressBarStyleHorizontal
+                      ).apply {
+                          max = 100
+                          visibility = android.view.View.GONE
+                      }
+
+                  panel.addView(progressBar)
+
+                  statusText = TextView(this).apply {
+                      text =
+                          "Connect to the internet once to download Kathmandu Valley for offline use."
+                      textSize = 12f
+                      setPadding(8, 4, 8, 4)
+                  }
+
+                  panel.addView(statusText)
+
+                  search.setOnEditorActionListener { _, _, _ ->
+                      val query = search.text.toString().trim()
+
+                      if (query.isNotEmpty()) {
+                          searchKnownPlaces(query)
+                      }
+
+                      true
+                  }
+
+                  val panelParams =
+                      FrameLayout.LayoutParams(
+                          -1,
+                          FrameLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          setMargins(20, 30, 20, 0)
+                      }
+
+                  root.addView(panel, panelParams)
+
+                  val attribution = TextView(this).apply {
+                      text =
+                          "Map data © OpenStreetMap contributors • OpenFreeMap"
+                      textSize = 10f
+                      setTextColor(Color.DKGRAY)
+                      setBackgroundColor(
+                          Color.argb(
+                              180,
+                              255,
+                              255,
+                              255
+                          )
+                      )
+                      setPadding(12, 6, 12, 6)
+                  }
+
+                  val attrParams =
+                      FrameLayout.LayoutParams(
+                          FrameLayout.LayoutParams.WRAP_CONTENT,
+                          FrameLayout.LayoutParams.WRAP_CONTENT
+                      ).apply {
+                          gravity =
+                              android.view.Gravity.BOTTOM or
+                              android.view.Gravity.START
+
+                          setMargins(12, 0, 0, 12)
+                      }
+
+                  root.addView(
+                      attribution,
+                      attrParams
+                  )
+
+                  setContentView(root)
+              }
+
+              private fun loadStyleWithFallback() {
+
+                  map.setStyle(
+                      Style.Builder().fromUri(styleUrl)
+                  ) {
+
+                      map.cameraPosition =
+                          CameraPosition.Builder()
+                              .target(
+                                  LatLng(
+                                      27.7172,
+                                      85.3240
+                                  )
+                              )
+                              .zoom(11.2)
+                              .build()
+
+                      addLandmarkMarkers()
+
+                      if (hasLocationPermission()) {
+                          showLastLocation()
+                      }
+                  }
+
+                  if (
+                      !isOnline() &&
+                      !hasCompletedOfflineRegion()
+                  ) {
+                      statusText.text =
+                          "No offline map has been downloaded yet. Connect once and press Download Offline."
+                  }
+              }
+
+              private fun isOnline(): Boolean {
+
+                  val cm =
+                      getSystemService(
+                          Context.CONNECTIVITY_SERVICE
+                      ) as ConnectivityManager
+
+                  val network =
+                      cm.activeNetwork
+                          ?: return false
+
+                  val caps =
+                      cm.getNetworkCapabilities(network)
+                          ?: return false
+
+                  return caps.hasCapability(
+                      NetworkCapabilities.NET_CAPABILITY_INTERNET
+                  )
+              }
+
+              private fun hasCompletedOfflineRegion(): Boolean {
+                  return prefs.getBoolean(
+                      "offline_region_complete",
+                      false
+                  )
+              }
+
+              private fun addLandmarkMarkers() {
+
+                  knownPlaces.forEach { poi ->
+
+                      map.addMarker(
+                          MarkerOptions()
+                              .position(
+                                  LatLng(
+                                      poi.lat,
+                                      poi.lng
+                                  )
+                              )
+                              .title(poi.name)
+                              .snippet(
+                                  "${poi.city} - ${poi.note}"
+                              )
+                      )
+                  }
+              }
+
+              private fun hasLocationPermission(): Boolean {
+
+                  return ActivityCompat.checkSelfPermission(
+                      this,
+                      Manifest.permission.ACCESS_FINE_LOCATION
+                  ) == PackageManager.PERMISSION_GRANTED
+              }
+
+              private fun requestOrLocate() {
+
+                  if (!hasLocationPermission()) {
+
+                      ActivityCompat.requestPermissions(
+                          this,
+                          arrayOf(
+                              Manifest.permission.ACCESS_FINE_LOCATION,
+                              Manifest.permission.ACCESS_COARSE_LOCATION
+                          ),
+                          42
+                      )
+
+                      return
+                  }
+
+                  showLastLocation()
+              }
+
+              private fun showLastLocation() {
+
+                  fused.lastLocation
+                      .addOnSuccessListener { location ->
+
+                          if (location != null) {
+
+                              val position =
+                                  LatLng(
+                                      location.latitude,
+                                      location.longitude
+                                  )
+
+                              map.animateCamera(
+                                  CameraUpdateFactory
+                                      .newLatLngZoom(
+                                          position,
+                                          15.0
+                                      )
+                              )
+
+                              youAreHereMarker?.remove()
+
+                              youAreHereMarker =
+                                  map.addMarker(
+                                      MarkerOptions()
+                                          .position(position)
+                                          .title("You are here")
+                                  )
+
+                          } else {
+
+                              Toast.makeText(
+                                  this,
+                                  "Waiting for a GPS fix...",
+                                  Toast.LENGTH_SHORT
+                              ).show()
+                          }
+                      }
+              }
+
+              private fun onDownloadClicked() {
+
+                  if (activeRegion != null) {
+
+                      Toast.makeText(
+                          this,
+                          "Kathmandu Valley is already downloaded.",
+                          Toast.LENGTH_SHORT
+                      ).show()
+
+                      return
+                  }
+
+                  if (!isOnline()) {
+
+                      Toast.makeText(
+                          this,
+                          "Connect to the internet to download the offline map.",
+                          Toast.LENGTH_LONG
+                      ).show()
+
+                      return
+                  }
+
+                  downloadOfflineRegion()
+              }
+
+              private fun downloadOfflineRegion() {
+
+                  downloadButton.isEnabled = false
+                  progressBar.visibility = android.view.View.VISIBLE
+                  progressBar.progress = 0
+
+                  val manager =
+                      OfflineManager.getInstance(this)
+
+                  val definition =
+                      OfflineTilePyramidRegionDefinition(
+                          styleUrl,
+                          valleyBounds,
+                          8.0,
+                          16.0,
+                          resources.displayMetrics.density
+                      )
+
+                  manager.createOfflineRegion(
+                      definition,
+                      regionName.toByteArray(),
+                      object :
+                          OfflineManager.CreateOfflineRegionCallback {
+
+                          override fun onCreate(
+                              region: OfflineRegion
+                          ) {
+
+                              activeRegion = region
+
+                              region.setObserver(
+                                  object :
+                                      OfflineRegion.OfflineRegionObserver {
+
+                                      override fun onStatusChanged(
+                                          status: OfflineRegionStatus
+                                      ) {
+
+                                          runOnUiThread {
+
+                                              val percent =
+                                                  if (
+                                                      status.requiredResourceCount > 0
+                                                  ) {
+                                                      (
+                                                          status.completedResourceCount
+                                                              .toDouble() /
+                                                          status.requiredResourceCount *
+                                                          100
+                                                      ).toInt()
+                                                  } else {
+                                                      0
+                                                  }
+
+                                              progressBar.progress =
+                                                  percent
+
+                                              statusText.text =
+                                                  "Downloading Kathmandu Valley: $percent%"
+
+                                              if (status.isComplete) {
+
+                                                  downloadButton.isEnabled =
+                                                      true
+
+                                                  deleteButton.visibility =
+                                                      android.view.View.VISIBLE
+
+                                                  prefs.edit()
+                                                      .putBoolean(
+                                                          "offline_region_complete",
+                                                          true
+                                                      )
+                                                      .apply()
+
+                                                  statusText.text =
+                                                      "Kathmandu Valley is ready for offline use."
+
+                                                  Toast.makeText(
+                                                      this@MainActivity,
+                                                      "Offline map ready",
+                                                      Toast.LENGTH_LONG
+                                                  ).show()
+                                              }
+                                          }
+                                      }
+
+                                      override fun onError(
+                                          error: OfflineRegionError
+                                      ) {
+
+                                          runOnUiThread {
+
+                                              downloadButton.isEnabled =
+                                                  true
+
+                                              Toast.makeText(
+                                                  this@MainActivity,
+                                                  "Offline download error: ${error.message}",
+                                                  Toast.LENGTH_LONG
+                                              ).show()
+                                          }
+                                      }
+
+                                      override fun mapboxTileCountLimitExceeded(
+                                          limit: Long
+                                      ) {
+
+                                          runOnUiThread {
+
+                                              Toast.makeText(
+                                                  this@MainActivity,
+                                                  "Tile limit reached: $limit",
+                                                  Toast.LENGTH_LONG
+                                              ).show()
+                                          }
+                                      }
+                                  }
+                              )
+
+                              region.setDownloadState(
+                                  OfflineRegion.STATE_ACTIVE
+                              )
+
+                              runOnUiThread {
+
+                                  Toast.makeText(
+                                      this@MainActivity,
+                                      "Kathmandu Valley download started",
+                                      Toast.LENGTH_SHORT
+                                  ).show()
+                              }
+                          }
+
+                          override fun onError(
+                              error: String
+                          ) {
+
+                              runOnUiThread {
+
+                                  downloadButton.isEnabled =
+                                      true
+
+                                  progressBar.visibility =
+                                      android.view.View.GONE
+
+                                  Toast.makeText(
+                                      this@MainActivity,
+                                      error,
+                                      Toast.LENGTH_LONG
+                                  ).show()
+                              }
+                          }
+                      }
+                  )
+              }
+
+              private fun refreshExistingOfflineRegion() {
+
+                  val manager =
+                      OfflineManager.getInstance(this)
+
+                  manager.listOfflineRegions(
+                      object :
+                          OfflineManager.ListOfflineRegionsCallback {
+
+                          override fun onList(
+                              offlineRegions:
+                                  Array<OfflineRegion>?
+                          ) {
+
+                              val existing =
+                                  offlineRegions
+                                      ?.firstOrNull {
+                                          String(it.metadata) ==
+                                              regionName
+                                      }
+
+                              if (existing != null) {
+
+                                  activeRegion = existing
+
+                                  prefs.edit()
+                                      .putBoolean(
+                                          "offline_region_complete",
+                                          true
+                                      )
+                                      .apply()
+
+                                  runOnUiThread {
+
+                                      deleteButton.visibility =
+                                          android.view.View.VISIBLE
+
+                                      statusText.text =
+                                          "Kathmandu Valley is available offline."
+                                  }
+                              }
+                          }
+
+                          override fun onError(
+                              error: String
+                          ) {
+                          }
+                      }
+                  )
+              }
+
+              private fun confirmAndDeleteOfflineRegion() {
+
+                  val region =
+                      activeRegion ?: return
+
+                  androidx.appcompat.app.AlertDialog.Builder(this)
+                      .setTitle("Delete offline map?")
+                      .setMessage(
+                          "This removes the downloaded Kathmandu Valley map."
+                      )
+                      .setPositiveButton("Delete") { _, _ ->
+
+                          region.delete(
+                              object :
+                                  OfflineRegion.OfflineRegionDeleteCallback {
+
+                                  override fun onDelete() {
+
+                                      activeRegion = null
+
+                                      prefs.edit()
+                                          .putBoolean(
+                                              "offline_region_complete",
+                                              false
+                                          )
+                                          .apply()
+
+                                      runOnUiThread {
+
+                                          deleteButton.visibility =
+                                              android.view.View.GONE
+
+                                          progressBar.visibility =
+                                              android.view.View.GONE
+
+                                          statusText.text =
+                                              "Offline map deleted."
+
+                                          Toast.makeText(
+                                              this@MainActivity,
+                                              "Offline map deleted",
+                                              Toast.LENGTH_SHORT
+                                          ).show()
+                                      }
+                                  }
+
+                                  override fun onError(
+                                      error: String
+                                  ) {
+
+                                      runOnUiThread {
+
+                                          Toast.makeText(
+                                              this@MainActivity,
+                                              "Couldn't delete: $error",
+                                              Toast.LENGTH_LONG
+                                          ).show()
+                                      }
+                                  }
+                              }
+                          )
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              private fun searchKnownPlaces(
+                  query: String
+              ) {
+
+                  val match =
+                      knownPlaces.firstOrNull {
+
+                          it.name.contains(
+                              query,
+                              ignoreCase = true
+                          ) ||
+                          it.city.contains(
+                              query,
+                              ignoreCase = true
+                          )
+                      }
+
+                  if (match == null) {
+
+                      Toast.makeText(
+                          this,
+                          "Place not found",
+                          Toast.LENGTH_LONG
+                      ).show()
+
+                      return
+                  }
+
+                  val position =
+                      LatLng(
+                          match.lat,
+                          match.lng
+                      )
+
+                  map.animateCamera(
+                      CameraUpdateFactory
+                          .newLatLngZoom(
+                              position,
+                              15.5
+                          )
+                  )
+
+                  searchMarker?.remove()
+
+                  searchMarker =
+                      map.addMarker(
+                          MarkerOptions()
+                              .position(position)
+                              .title(match.name)
+                              .snippet(match.note)
+                      )
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  mapView.onStart()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  mapView.onResume()
+              }
+
+              override fun onPause() {
+                  mapView.onPause()
+                  super.onPause()
+              }
+
+              override fun onStop() {
+                  mapView.onStop()
+                  super.onStop()
+              }
+
+              override fun onDestroy() {
+                  mapView.onDestroy()
+                  super.onDestroy()
+              }
+
+              override fun onLowMemory() {
+                  super.onLowMemory()
+                  mapView.onLowMemory()
+              }
+          }
+          EOF
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -50,7 +895,7 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Build debug APK
+      - name: Build APK
         working-directory: extracted/KathmanduValleyOfflineMaps
         run: gradle assembleDebug --no-daemon
 
@@ -59,3 +904,9 @@ jobs:
         with:
           name: KathmanduValleyOfflineMaps-debug-apk
           path: extracted/KathmanduValleyOfflineMaps/app/build/outputs/apk/debug/*.apk
+
+This follows the structure of your uploaded workflow, including the unzip step, Android/Java configuration, MapLibre dependency, Kotlin activity, offline-region download, GPS location, search, and APK artifact upload.
+
+Important: this is the GitHub Actions build code, not the entire Android project. Your repository still needs "KathmanduValleyOfflineMaps.zip" in the repository root, because the workflow explicitly unzips that file.
+
+Do you want 1) complete Android project, 2) GitHub-ready ZIP, or 3) APK-building setup?
